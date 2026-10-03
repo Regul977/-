@@ -16,18 +16,22 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    PollAnswer,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # ================== НАСТРОЙКИ ==================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8963149421:AAHn1fHaHY-aRrvToq0lxdScWji4gX128_4")
 
-ADMIN_IDS = [1281286200, 5890881555]
+# Список ID администраторов (узнать свой — @userinfobot)
+ADMIN_IDS = [5890881555, 1281286200]
 
+# Часовой пояс: Europe/Moscow, Europe/Kyiv, Asia/Almaty и т. д.
 TIMEZONE = "Europe/Moscow"
 
+# Файлы JSON
 CONFIG_FILE = Path("config.json")
 ACTIVE_POLL_FILE = Path("active_poll.json")
 
@@ -38,6 +42,7 @@ DEFAULT_CONFIG = {
     "topic_name": None,
 }
 
+# Текст опроса
 POLL_QUESTION = "Для тех кто опаздывает"
 POLL_OPTIONS = [
     "Я приду к 1 паре",
@@ -45,19 +50,19 @@ POLL_OPTIONS = [
     "Я по заявлению",
 ]
 
-# Сколько секунд живут служебные сообщения бота в чате
+# Время жизни служебных сообщений бота (секунды)
 TEMP_MESSAGE_TTL = 10
 
-# Через сколько секунд удалять команду пользователя
+# Время жизни команды пользователя (секунды)
 USER_COMMAND_TTL = 3
 
-# Через сколько секунд удалять сервисные сообщения Telegram о темах
+# Время жизни сервисных сообщений Telegram о темах (секунды)
 SERVICE_MESSAGE_TTL = 10
 
-# Страна для проверки праздников (можно поменять: "RU", "UA", "KZ", "BY", ...)
+# Страна для проверки праздников: RU, UA, KZ, BY, US, DE и т. д.
 HOLIDAY_COUNTRY = "RU"
 
-# Если True — игнорировать проверку рабочего дня (удобно для тестов)
+# Игнорировать проверку рабочего дня (True — удобно для отладки)
 SKIP_WORKDAY_CHECK = False
 
 # ================== ЛОГИРОВАНИЕ ==================
@@ -121,41 +126,42 @@ def save_active_poll(data: Dict[str, Any]) -> None:
     write_json(ACTIVE_POLL_FILE, data)
 
 
-# ================== ПРОВЕРКА РАБОЧЕГО ДНЯ ==================
+# ================== ГОЛОСА ==================
 
-def is_workday(check_date: Optional[datetime] = None) -> bool:
-    """
-    Проверяет, является ли день рабочим:
-    - не суббота и не воскресенье
-    - не официальный праздник страны HOLIDAY_COUNTRY
-    """
-    if check_date is None:
-        check_date = datetime.now(ZoneInfo(TIMEZONE))
+def add_vote_to_active_poll(user: dict, option_ids: list) -> None:
+    """Сохраняет/обновляет голос пользователя в active_poll.json."""
+    active = read_active_poll()
+    if not active:
+        return
 
-    # Выходной (суббота=5, воскресенье=6)
-    if check_date.weekday() >= 5:
-        logger.info("Сегодня выходной (%s) — опрос не отправляется", check_date.strftime("%A"))
-        return False
+    votes = active.get("votes", {})
+    user_id = str(user.get("id"))
 
-    # Праздник
-    try:
-        country_holidays = holidays.country_holidays(
-            HOLIDAY_COUNTRY,
-            years=check_date.year,
-        )
-    except Exception as e:
-        logger.warning("Не удалось загрузить праздники для %s: %s", HOLIDAY_COUNTRY, e)
-        return True
+    if not option_ids:
+        votes.pop(user_id, None)  # пользователь отозвал голос
+    else:
+        votes[user_id] = {
+            "username": user.get("username"),
+            "first_name": user.get("first_name"),
+            "last_name": user.get("last_name"),
+            "option_ids": option_ids,
+        }
 
-    if check_date.date() in country_holidays:
-        logger.info(
-            "Сегодня праздник: %s — %s",
-            check_date.date(),
-            country_holidays.get(check_date.date()),
-        )
-        return False
+    active["votes"] = votes
+    save_active_poll(active)
 
-    return True
+
+def format_user_label(vote: dict) -> str:
+    """@username, если есть, иначе «Имя Фамилия», иначе «без имени»."""
+    username = vote.get("username")
+    first_name = (vote.get("first_name") or "").strip()
+    last_name = (vote.get("last_name") or "").strip()
+
+    if username:
+        return f"@{username}"
+
+    full = f"{first_name} {last_name}".strip()
+    return full or "без имени"
 
 
 # ================== ПРАВА И УВЕДОМЛЕНИЯ ==================
@@ -168,6 +174,14 @@ async def notify_admins(bot: Bot, text: str) -> None:
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.warning("Не удалось отправить сообщение админу %s: %s", admin_id, e)
+
+
+async def notify_admins_html(bot: Bot, text: str) -> None:
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception as e:
             logger.warning("Не удалось отправить сообщение админу %s: %s", admin_id, e)
 
@@ -197,12 +211,7 @@ async def _delete_service_message(
     message_id: int,
     delay: int = SERVICE_MESSAGE_TTL,
 ) -> None:
-    """
-    Удаляет сервисное сообщение через delay секунд.
-    Если сразу не получилось — одна повторная попытка через 0.5 сек.
-    """
     await asyncio.sleep(delay)
-
     for attempt in (1, 2):
         try:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -213,6 +222,34 @@ async def _delete_service_message(
                 await asyncio.sleep(0.5)
                 continue
             logger.warning("Не удалось удалить сервисное сообщение %s: %s", message_id, e)
+
+
+# ================== ПРОВЕРКА РАБОЧЕГО ДНЯ ==================
+
+def is_workday(check_date: Optional[datetime] = None) -> bool:
+    """Будний день и не праздник."""
+    if check_date is None:
+        check_date = datetime.now(ZoneInfo(TIMEZONE))
+
+    if check_date.weekday() >= 5:
+        logger.info("Сегодня выходной (%s) — опрос не отправляется", check_date.strftime("%A"))
+        return False
+
+    try:
+        country_holidays = holidays.country_holidays(HOLIDAY_COUNTRY, years=check_date.year)
+    except Exception as e:
+        logger.warning("Не удалось загрузить праздники для %s: %s", HOLIDAY_COUNTRY, e)
+        return True
+
+    if check_date.date() in country_holidays:
+        logger.info(
+            "Сегодня праздник: %s — %s",
+            check_date.date(),
+            country_holidays.get(check_date.date()),
+        )
+        return False
+
+    return True
 
 
 # ================== СЕРВИСНЫЕ СООБЩЕНИЯ ТЕМ ==================
@@ -226,17 +263,8 @@ async def _delete_service_message(
     | F.general_forum_topic_unhidden
 )
 async def delete_topic_service_message(message: Message, bot: Bot) -> None:
-    """
-    Удаляет служебные сообщения Telegram о темах через SERVICE_MESSAGE_TTL секунд:
-    «Тема создана», «Тема закрыта», «Тема возобновлена» и т. п.
-    """
     asyncio.create_task(
-        _delete_service_message(
-            bot,
-            message.chat.id,
-            message.message_id,
-            delay=SERVICE_MESSAGE_TTL,
-        )
+        _delete_service_message(bot, message.chat.id, message.message_id, SERVICE_MESSAGE_TTL)
     )
 
 
@@ -244,19 +272,13 @@ async def delete_topic_service_message(message: Message, bot: Bot) -> None:
 
 async def open_topic(bot: Bot, chat_id: int, thread_id: int) -> bool:
     try:
-        service = await bot.reopen_forum_topic(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-        )
+        service = await bot.reopen_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
         logger.info("Тема %s открыта", thread_id)
 
         if service is not None and getattr(service, "message_id", None):
             asyncio.create_task(
-                _delete_service_message(
-                    bot, chat_id, service.message_id, delay=SERVICE_MESSAGE_TTL
-                )
+                _delete_service_message(bot, chat_id, service.message_id, SERVICE_MESSAGE_TTL)
             )
-
         return True
 
     except TelegramBadRequest as e:
@@ -270,19 +292,13 @@ async def open_topic(bot: Bot, chat_id: int, thread_id: int) -> bool:
 
 async def close_topic(bot: Bot, chat_id: int, thread_id: int) -> None:
     try:
-        service = await bot.close_forum_topic(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-        )
+        service = await bot.close_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
         logger.info("Тема %s закрыта обратно", thread_id)
 
         if service is not None and getattr(service, "message_id", None):
             asyncio.create_task(
-                _delete_service_message(
-                    bot, chat_id, service.message_id, delay=SERVICE_MESSAGE_TTL
-                )
+                _delete_service_message(bot, chat_id, service.message_id, SERVICE_MESSAGE_TTL)
             )
-
     except TelegramBadRequest as e:
         logger.warning("Не удалось закрыть тему %s: %s", thread_id, e)
 
@@ -295,10 +311,11 @@ def get_welcome_text() -> str:
         "<b>Что я умею:</b>\n"
         "• Каждый день <b>по будням</b> в <b>7:30</b> отправляю опрос в выбранную тему\n"
         "• В <b>9:30</b> автоматически закрываю его и присылаю отчёт админам\n"
+        "• В отчёте: количество голосов и <b>кто именно проголосовал</b>\n"
         "• Опрос: <i>«Для тех кто опаздывает»</i>\n"
         "• Варианты: <i>«Я приду к 1 паре», «Я опаздываю на 1 пару», «Я по заявлению»</i>\n"
         "• Голосование <b>не анонимное</b> — видно, кто как ответил\n"
-        "• Опрос <b>не отправляется</b> в выходные и праздничные дни\n\n"
+        "• Опрос <b>не отправляется</b> в выходные и праздники\n\n"
         "<b>Команды:</b>\n"
         "/start — показать это сообщение и меню\n"
         "/help — то же, что /start\n"
@@ -329,9 +346,7 @@ def get_main_menu() -> InlineKeyboardMarkup:
 @router.message(Command("start"))
 @router.message(Command("help"))
 async def cmd_start(message: Message) -> None:
-    """
-    Приветствие + меню. Приветственное сообщение НЕ удаляется.
-    """
+    """Приветствие + меню. Приветствие НЕ удаляется."""
     if not is_admin(message.from_user.id if message.from_user else None):
         await send_temp(message, "⛔ У вас нет доступа к этому боту.")
         await delete_user_command(message)
@@ -405,7 +420,6 @@ async def cmd_set_topic(message: Message, bot: Bot) -> None:
         "Сохранена тема: chat_id=%s, thread_id=%s, topic=%s",
         message.chat.id, thread_id, topic_name,
     )
-
     await delete_user_command(message)
 
 
@@ -418,7 +432,6 @@ async def cmd_test_poll(message: Message, bot: Bot) -> None:
 
     await send_temp(message, "Запускаю тестовый опрос...")
     await delete_user_command(message)
-    # Тест не проверяет рабочий день — опрос отправится даже в выходной
     await send_daily_poll(bot, force=True)
 
 
@@ -430,7 +443,6 @@ async def cmd_stop_poll(message: Message, bot: Bot) -> None:
         return
 
     active = read_active_poll()
-
     if not active.get("chat_id") or not active.get("message_id"):
         await send_temp(message, "ℹ️ Активного опроса сейчас нет.")
         await delete_user_command(message)
@@ -439,6 +451,37 @@ async def cmd_stop_poll(message: Message, bot: Bot) -> None:
     await send_temp(message, "Завершаю опрос досрочно...")
     await delete_user_command(message)
     await stop_daily_poll(bot)
+
+
+# ================== ГОЛОСОВАНИЕ ==================
+
+@router.poll_answer()
+async def on_poll_answer(poll_answer: PollAnswer) -> None:
+    """Ловит голоса в нашем неанонимном опросе и сохраняет их в active_poll.json."""
+    active = read_active_poll()
+
+    if not active or active.get("poll_id") != poll_answer.poll_id:
+        return
+
+    user = poll_answer.user
+    if user is None:
+        return
+
+    user_dict = {
+        "id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+    }
+
+    add_vote_to_active_poll(user_dict, poll_answer.option_ids)
+
+    logger.info(
+        "Голос: user_id=%s (%s), варианты=%s",
+        user.id,
+        user_dict.get("username") or user_dict.get("first_name"),
+        poll_answer.option_ids,
+    )
 
 
 # ================== ОБРАБОТКА КНОПОК МЕНЮ ==================
@@ -476,6 +519,7 @@ async def on_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
 
         if active.get("message_id"):
             text += f"\n\n🟢 Сейчас активен опрос (message_id={active.get('message_id')})."
+            text += f"\nГолосов получено: {len(active.get('votes', {}))}"
 
         await callback.answer(text, show_alert=True)
 
@@ -501,7 +545,6 @@ async def on_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
             f"Тема для опросов обновлена: {chat_title} / {topic_name} (thread_id={thread_id})"
         )
         logger.info("Тема выбрана через кнопку: chat_id=%s, thread_id=%s", chat_id, thread_id)
-
         await callback.answer(f"✅ Тема сохранена:\n{chat_title} / {topic_name}", show_alert=True)
 
     elif action == "test_poll":
@@ -511,7 +554,6 @@ async def on_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
             return
 
         await callback.answer("Запускаю тестовый опрос...")
-        # Тест не проверяет рабочий день
         await send_daily_poll(bot, force=True)
 
     elif action == "stop_poll":
@@ -532,14 +574,9 @@ async def on_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
 async def send_daily_poll(bot: Bot, force: bool = False) -> None:
     """
     Создаёт ежедневный опрос в выбранной теме.
-    Перед отправкой открывает тему (если она закрыта),
-    после отправки — закрывает обратно.
-
-    Если force=False (по умолчанию) — опрос отправляется только
-    по будням и не в праздники.
-    Если force=True (тест) — проверка рабочего дня пропускается.
+    Перед отправкой открывает тему, после — закрывает.
+    force=True используется для /test_poll — игнорирует проверку рабочего дня.
     """
-    # Проверка рабочего дня
     if not force and not SKIP_WORKDAY_CHECK and not is_workday():
         logger.info("Сегодня выходной или праздник — опрос не отправляется")
         return
@@ -581,9 +618,11 @@ async def send_daily_poll(bot: Bot, force: bool = False) -> None:
         save_active_poll({
             "chat_id": chat_id,
             "message_id": message.message_id,
+            "poll_id": message.poll.id,
             "thread_id": thread_id,
             "chat_title": config.get("chat_title"),
             "topic_name": config.get("topic_name"),
+            "votes": {},
         })
 
         logger.info("Опрос создан: chat_id=%s, message_id=%s", chat_id, message.message_id)
@@ -600,13 +639,12 @@ async def send_daily_poll(bot: Bot, force: bool = False) -> None:
     except Exception as e:
         logger.exception("Неожиданная ошибка при создании опроса")
         await notify_admins(bot, f"❌ Ошибка при создании опроса: {e}")
-
     finally:
         await close_topic(bot, chat_id, thread_id)
 
 
 async def stop_daily_poll(bot: Bot) -> None:
-    """Останавливает опрос и отправляет отчёт администраторам."""
+    """Закрывает опрос и присылает подробный отчёт с юзернеймами."""
     active = read_active_poll()
 
     chat_id = active.get("chat_id")
@@ -620,17 +658,36 @@ async def stop_daily_poll(bot: Bot) -> None:
     try:
         poll = await bot.stop_poll(chat_id=chat_id, message_id=message_id)
 
-        results = ", ".join(
-            f"{option.text}: {option.voter_count}" for option in poll.options
-        )
+        votes = active.get("votes", {})
+        voters_by_option: Dict[int, list] = {i: [] for i in range(len(poll.options))}
+
+        for user_id, vote in votes.items():
+            label = format_user_label(vote)
+            for opt_idx in vote.get("option_ids", []):
+                if opt_idx in voters_by_option:
+                    voters_by_option[opt_idx].append(label)
+
+        lines = []
+        for idx, option in enumerate(poll.options):
+            voters = voters_by_option.get(idx, [])
+            if voters:
+                lines.append(
+                    f"• <b>{option.text}</b> — {option.voter_count} чел.\n"
+                    f"    {', '.join(voters)}"
+                )
+            else:
+                lines.append(f"• <b>{option.text}</b> — 0 чел.")
+
+        results_text = "\n\n".join(lines)
 
         text = (
-            f"Опрос в чате {active.get('chat_title', chat_id)} завершен. "
-            f"Всего проголосовало: {poll.total_voter_count} человек. "
-            f"Результаты: {results}"
+            f"📊 <b>Опрос в чате «{active.get('chat_title', chat_id)}» завершен.</b>\n"
+            f"Тема: {active.get('topic_name', '—')}\n\n"
+            f"Всего проголосовало: <b>{poll.total_voter_count}</b> человек.\n\n"
+            f"{results_text}"
         )
 
-        await notify_admins(bot, text)
+        await notify_admins_html(bot, text)
         save_active_poll({})
 
         logger.info("Опрос закрыт: chat_id=%s, message_id=%s", chat_id, message_id)
@@ -658,7 +715,6 @@ async def startup_check(bot: Bot) -> None:
     active = read_active_poll()
     if active.get("chat_id") and active.get("message_id"):
         now = datetime.now(ZoneInfo(TIMEZONE))
-
         if now.hour > 9 or (now.hour == 9 and now.minute >= 30):
             logger.info("Найден активный опрос после 9:30. Закрываю...")
             await stop_daily_poll(bot)
@@ -681,39 +737,24 @@ async def main() -> None:
 
     scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
 
-    # Ежедневно с понедельника по пятницу в 7:30 — создание опроса.
-    # Праздники отсекаются внутри send_daily_poll через is_workday().
+    # Пн–пт в 7:30 — создание опроса
     scheduler.add_job(
         send_daily_poll,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour=7,
-            minute=30,
-            timezone=ZoneInfo(TIMEZONE),
-        ),
-        args=[bot],
-        id="send_daily_poll",
-        replace_existing=True,
+        CronTrigger(day_of_week="mon-fri", hour=7, minute=30, timezone=ZoneInfo(TIMEZONE)),
+        args=[bot], id="send_daily_poll", replace_existing=True,
     )
 
-    # Ежедневно в 9:30 — закрытие опроса и отчёт (сработает, если опрос был открыт)
+    # Ежедневно в 9:30 — закрытие опроса и отчёт
     scheduler.add_job(
         stop_daily_poll,
-        CronTrigger(
-            hour=9,
-            minute=30,
-            timezone=ZoneInfo(TIMEZONE),
-        ),
-        args=[bot],
-        id="stop_daily_poll",
-        replace_existing=True,
+        CronTrigger(hour=9, minute=30, timezone=ZoneInfo(TIMEZONE)),
+        args=[bot], id="stop_daily_poll", replace_existing=True,
     )
 
     scheduler.start()
     logger.info(
         "Планировщик запущен. Часовой пояс: %s. Опросы: пн–пт в 7:30, кроме праздников (%s).",
-        TIMEZONE,
-        HOLIDAY_COUNTRY,
+        TIMEZONE, HOLIDAY_COUNTRY,
     )
 
     await startup_check(bot)
